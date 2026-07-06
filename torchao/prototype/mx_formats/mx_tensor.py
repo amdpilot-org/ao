@@ -36,7 +36,15 @@ from torchao.utils import is_sm_at_least_100, torch_version_at_least
 if torch_version_at_least("2.12.0.dev0"):
     from torch._higher_order_ops.inline_asm_elementwise import inline_asm_elementwise
 
-from torch.nn.functional import ScalingType, SwizzleType
+# ScalingType / SwizzleType are only available on torch >= 2.11 and are used
+# solely by the CUDA Blackwell ``F.scaled_mm`` MX-FP4 path below. On ROCm we
+# dispatch MX-FP4 matmul to AITER (see ``_mxfp4_rocm_dispatch``), so guard the
+# import to keep the module importable on older / non-CUDA torch builds.
+try:
+    from torch.nn.functional import ScalingType, SwizzleType
+except ImportError:  # pragma: no cover - torch < 2.11 or non-CUDA build
+    ScalingType = None
+    SwizzleType = None
 
 from torchao.prototype.mx_formats.config import (
     MXFP8Dim0CastKernelChoice,
@@ -754,6 +762,49 @@ def maybe_dtensor_to_blocked(t: torch.Tensor) -> torch.Tensor:
     return out
 
 
+_MXFP4_ROCM_CACHE: dict = {}
+
+
+def _mxfp4_rocm_dispatch(
+    a: torch.Tensor, b: MXTensor, bias: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """ROCm fast path for weight-only MXFP4 (bf16 activation x fp4 weight):
+    route to AITER ``gemm_a16wfp4`` (the ``matmul_mxfp4_bf16`` equivalent).
+
+    ``b`` is an (K, N) MXFP4Tensor produced by transposing an (N, K) weight
+    (the linear/addmm path); its qdata is a non-contiguous view of the
+    AITER-native (N, K//2) packing and is recovered with a cached
+    ``.t().contiguous()`` copy (paid once per weight). AITER quantizes the
+    bf16 activation to MXFP4 on the fly, matching torchao's dynamic-activation
+    MXFP4 semantics.
+    """
+    from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
+
+    # Recover AITER-native (N, K//2) weight layout. b.qdata is a (K//2, N)
+    # non-contiguous transpose view of the original (N, K//2) packing, so
+    # .t().contiguous() restores it. Cache by data_ptr (stable per weight) so
+    # the copy is paid only on the first call.
+    key = b.qdata.data_ptr()
+    cached = _MXFP4_ROCM_CACHE.get(key)
+    if cached is None:
+        w_qdata = b.qdata.t().contiguous()  # (N, K//2) uint8
+        w_scale = b.scale.t().contiguous().view(torch.uint8)  # (N, K//32) uint8
+        _MXFP4_ROCM_CACHE[key] = (w_qdata, w_scale)
+        if len(_MXFP4_ROCM_CACHE) > 32:
+            _MXFP4_ROCM_CACHE.pop(next(iter(_MXFP4_ROCM_CACHE)))
+    else:
+        w_qdata, w_scale = cached
+
+    orig_shape = a.shape
+    a_2d = a.reshape(-1, orig_shape[-1]).contiguous()
+    y = gemm_a16wfp4(a_2d, w_qdata, w_scale, dtype=a.dtype)
+    if bias is not None:
+        y = y + bias
+    if len(orig_shape) > 2:
+        y = y.view(*orig_shape[:-1], y.shape[-1])
+    return y
+
+
 def _addmm_mx_dispatch(
     a: torch.Tensor, b: MXTensor, aten_op, bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -761,6 +812,18 @@ def _addmm_mx_dispatch(
     Core implementation shared between mx_mm and mx_addmm.
     The only difference is whether bias is None or not.
     """
+
+    # ROCm: route weight-only MXFP4 (bf16 act x fp4 weight) to AITER
+    # gemm_a16wfp4. Only the transposed (linear/addmm) layout is supported --
+    # its qdata is a non-contiguous view of the AITER-native (N, K//2) packing.
+    if (
+        torch.version.hip
+        and isinstance(b, MXTensor)
+        and not isinstance(a, MXTensor)
+        and b.elem_dtype == torch.float4_e2m1fn_x2
+        and not b.qdata.is_contiguous()
+    ):
+        return _mxfp4_rocm_dispatch(a, b, bias)
 
     if not isinstance(a, MXTensor):
         assert b.act_quant_kwargs is not None, "weight-only quant not yet supported"
@@ -775,6 +838,10 @@ def _addmm_mx_dispatch(
         )
 
     gemm_choice = _get_gemm_choice(a.kernel_preference, b.kernel_preference)
+    # ROCm has no CUTLASS scaled_mm; use the emulated dequant+mm path for any
+    # MXFP4 case not handled by the AITER fast path above.
+    if torch.version.hip and gemm_choice == KernelPreference.AUTO:
+        gemm_choice = KernelPreference.EMULATED
 
     if gemm_choice == KernelPreference.AUTO:
         # real MX gemm backed by torchao's CUTLASS kernels
